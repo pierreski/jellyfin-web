@@ -2115,6 +2115,33 @@ export class HtmlVideoPlayer {
         }
     }
 
+    getSeekableRanges() {
+        const mediaElement = this.#mediaElement;
+        const seekable = mediaElement?.seekable;
+        if (!seekable?.length) {
+            return [];
+        }
+
+        const offset = this._currentPlayOptions?.transcodingOffsetTicks || 0;
+        const ranges = [];
+        for (let i = 0; i < seekable.length; i++) {
+            const start = seekable.start(i);
+            const end = seekable.end(i);
+            if (isValidDuration(start) && isValidDuration(end) && end > start) {
+                ranges.push({
+                    start: start * 10000000 + offset,
+                    end: end * 10000000 + offset
+                });
+            }
+        }
+
+        return ranges;
+    }
+
+    isSeeking() {
+        return this.#mediaElement?.seeking === true;
+    }
+
     pause() {
         const mediaElement = this.#mediaElement;
         if (mediaElement) {

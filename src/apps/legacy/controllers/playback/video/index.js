@@ -186,6 +186,23 @@ export default function (view) {
         return !(item.Type !== 'TvChannel' || !item.CurrentProgram);
     }
 
+    /**
+     * Returns the current live-edge position ticks for an in-progress recording.
+     * Uses real-time clock so it advances even without a server round-trip.
+     * The value is capped to the scheduled recording end.
+     */
+    function getLiveEdgeTicks() {
+        if (!isInProgressRecording || recordingLiveEdgeTicks == null) return null;
+        const elapsedTicks = Math.max(0, Date.now() - recordingLiveEdgeUpdatedAt) * 1e4;
+        const scheduledTicks = recordingScheduledTicks || Number.MAX_SAFE_INTEGER;
+        return Math.min(recordingLiveEdgeTicks + elapsedTicks, scheduledTicks);
+    }
+
+    function getSeekableLiveEdgeTicks() {
+        const liveEdgeTicks = getLiveEdgeTicks();
+        return liveEdgeTicks == null ? null : Math.max(0, liveEdgeTicks - 10 * TICKS_PER_SECOND);
+    }
+
     function updateNowPlayingInfo(player, state) {
         const item = state.NowPlayingItem;
 
@@ -206,6 +223,35 @@ export default function (view) {
         }
 
         enableProgressByTimeOfDay = shouldEnableProgressByTimeOfDay(item);
+
+        // Detect in-progress recording for time-shifting
+        // Live TV exposes active recordings as ordinary movie/episode items. The status
+        // field survives playback translation when playback was started from the DVR list.
+        const activeRecordingSource = currentPlayer?.streamInfo?.mediaSource;
+        isInProgressRecording = item.IsInProgress === true || item.Status === 'InProgress' || activeRecordingSource?.IsInProgressRecording === true;
+        if (isInProgressRecording) {
+            const recordingStartDate = item.StartDate || activeRecordingSource?.RecordingStartDate;
+            const recordingEndDate = item.EndDate || activeRecordingSource?.RecordingEndDate;
+            recordingStartMs = recordingStartDate ? datetime.parseISO8601Date(recordingStartDate).getTime() : 0;
+            recordingEndMs = recordingEndDate ? datetime.parseISO8601Date(recordingEndDate).getTime() : 0;
+            recordingScheduledTicks = item.RunTimeTicks || (recordingEndMs > recordingStartMs
+                ? (recordingEndMs - recordingStartMs) * 1e4
+                : 0);
+            if (recordingLiveEdgeItemId !== item.Id) {
+                recordingLiveEdgeTicks = activeRecordingSource?.LiveEdgeTicks ?? null;
+                recordingLiveEdgeUpdatedAt = Date.now();
+                recordingLiveEdgeItemId = item.Id;
+            }
+        } else {
+            recordingStartMs = 0;
+            recordingEndMs = 0;
+            recordingScheduledTicks = 0;
+            recordingLiveEdgeTicks = null;
+            recordingLiveEdgeUpdatedAt = 0;
+            recordingLiveEdgeItemId = null;
+        }
+        updateLiveButton();
+
         getDisplayItem(item).then(updateDisplayItem);
         nowPlayingVolumeSlider.disabled = false;
         nowPlayingPositionSlider.disabled = false;
@@ -580,11 +626,27 @@ export default function (view) {
     }
 
     let loadingTimeout;
+    let seekRecoveryTimeout;
 
     function onWaiting() {
         loadingTimeout = setTimeout(() => {
             loading.show();
         }, 500);
+
+        clearTimeout(seekRecoveryTimeout);
+        seekRecoveryTimeout = setTimeout(() => {
+            const player = this;
+            const seekableRanges = player.getSeekableRanges?.();
+            if (currentPlayer !== player || !isInProgressRecording || !player.isSeeking?.() || !seekableRanges?.length) {
+                return;
+            }
+
+            const latestRange = seekableRanges[seekableRanges.length - 1];
+            const currentTimeTicks = playbackManager.currentTime(player) * 10000;
+            if (currentTimeTicks >= latestRange.end - TICKS_PER_SECOND) {
+                playbackManager.seek(Math.max(latestRange.start, latestRange.end - 2 * TICKS_PER_SECOND), player);
+            }
+        }, 2500);
     }
 
     function onCanPlay() {
@@ -592,6 +654,8 @@ export default function (view) {
             clearTimeout(loadingTimeout);
             loadingTimeout = null;
         }
+        clearTimeout(seekRecoveryTimeout);
+        seekRecoveryTimeout = null;
         loading.hide();
     }
 
@@ -652,6 +716,9 @@ export default function (view) {
             Events.off(player, 'canplay', onCanPlay);
             currentPlayer = null;
         }
+
+        clearTimeout(seekRecoveryTimeout);
+        seekRecoveryTimeout = null;
     }
 
     function onTimeUpdate() {
@@ -662,12 +729,23 @@ export default function (view) {
             if (now - lastUpdateTime >= 700) {
                 lastUpdateTime = now;
                 const player = this;
-                currentRuntimeTicks = playbackManager.duration(player);
+
+                if (isInProgressRecording) {
+                    // Keep the scheduled timeline stable while the recorded boundary moves.
+                    currentRuntimeTicks = recordingScheduledTicks || playbackManager.duration(player);
+                } else {
+                    currentRuntimeTicks = playbackManager.duration(player);
+                }
+
                 const currentTime = playbackManager.currentTime(player) * 10000;
                 updateTimeDisplay(currentTime, currentRuntimeTicks, playbackManager.playbackStartTime(player), playbackManager.getPlaybackRate(player), playbackManager.getBufferedRanges(player));
                 const item = currentItem;
                 refreshProgramInfoIfNeeded(player, item);
                 showComingUpNextIfNeeded(player, item, currentTime, currentRuntimeTicks);
+
+                if (isInProgressRecording) {
+                    updateLiveButton(currentTime);
+                }
             }
         }
     }
@@ -844,6 +922,47 @@ export default function (view) {
 
             nowPlayingPositionText.innerHTML = '';
             nowPlayingDurationText.innerHTML = '';
+        } else if (isInProgressRecording) {
+            // Time-shift mode: slider spans 0..live-edge; position is current playback time.
+            // runtimeTicks here is the live-edge ticks computed in onTimeUpdate.
+            if (nowPlayingPositionSlider && !nowPlayingPositionSlider.dragging) {
+                if (runtimeTicks) {
+                    let pct = positionTicks / runtimeTicks;
+                    pct *= 100;
+                    nowPlayingPositionSlider.value = Math.min(pct, 100);
+                } else {
+                    nowPlayingPositionSlider.value = 0;
+                }
+
+                if (nowPlayingPositionSlider) {
+                    const liveEdgeTicks = getLiveEdgeTicks();
+                    nowPlayingPositionSlider.setBufferedRanges(
+                        liveEdgeTicks == null ? bufferedRanges : [{ start: 0, end: liveEdgeTicks }],
+                        runtimeTicks,
+                        positionTicks
+                    );
+                }
+            }
+
+            // Position counter: show elapsed playback time
+            if (positionTicks >= 0) {
+                updateTimeText(nowPlayingPositionText, positionTicks);
+                nowPlayingPositionText.classList.remove('hide');
+            } else {
+                nowPlayingPositionText.classList.add('hide');
+            }
+
+            // Show how much content is currently available in the file, not the full scheduled slot.
+            const availableTicks = getLiveEdgeTicks();
+            nowPlayingDurationText.innerHTML = '';
+            if (availableTicks != null) {
+                updateTimeText(nowPlayingDurationText, availableTicks);
+                nowPlayingDurationText.classList.remove('hide');
+            } else {
+                nowPlayingDurationText.classList.add('hide');
+            }
+
+            endsAtText.innerHTML = '';
         } else {
             if (nowPlayingPositionSlider && !nowPlayingPositionSlider.dragging) {
                 if (runtimeTicks) {
@@ -1664,6 +1783,14 @@ export default function (view) {
     let playbackStartTimeTicks = 0;
     let subtitleSyncOverlay;
     let trickplayResolution = null;
+    // Time-shift support for in-progress recordings
+    let isInProgressRecording = false;
+    let recordingStartMs = 0;
+    let recordingEndMs = 0;
+    let recordingScheduledTicks = 0;
+    let recordingLiveEdgeTicks = null;
+    let recordingLiveEdgeUpdatedAt = 0;
+    let recordingLiveEdgeItemId = null;
     const nowPlayingVolumeSlider = view.querySelector('.osdVolumeSlider');
     const nowPlayingVolumeSliderContainer = view.querySelector('.osdVolumeSliderContainer');
     const nowPlayingPositionSlider = view.querySelector('.osdPositionSlider');
@@ -1674,9 +1801,34 @@ export default function (view) {
     const endsAtText = view.querySelector('.endsAtText');
     const btnRewind = view.querySelector('.btnRewind');
     const btnFastForward = view.querySelector('.btnFastForward');
+    const btnGoLive = view.querySelector('.btnGoLive');
     const transitionEndEventName = dom.whichTransitionEvent();
     const headerElement = document.querySelector('.skinHeader');
     const osdBottomElement = view.querySelector('.videoOsdBottom-maincontrols');
+
+    /**
+     * Shows/hides and styles the LIVE button based on whether playback is at the live edge.
+     * @param {number} [positionTicks] - Current playback position in ticks. If omitted, just shows/hides.
+     */
+    function updateLiveButton(positionTicks) {
+        if (!btnGoLive) return;
+        if (!isInProgressRecording) {
+            btnGoLive.classList.add('hide');
+            return;
+        }
+        btnGoLive.classList.remove('hide');
+
+        if (positionTicks != null) {
+            const liveEdgeTicks = getLiveEdgeTicks();
+            // Consider "at live" if within 15 seconds of live edge
+            const atLive = liveEdgeTicks != null && (liveEdgeTicks - positionTicks) < 15 * 10000 * 1000;
+            if (atLive) {
+                btnGoLive.classList.add('btnGoLive--atLive');
+            } else {
+                btnGoLive.classList.remove('btnGoLive--atLive');
+            }
+        }
+    }
 
     nowPlayingPositionSlider.enableKeyboardDragging();
     nowPlayingVolumeSlider.enableKeyboardDragging();
@@ -1884,11 +2036,31 @@ export default function (view) {
                 seekAirTimeTicks += 1e4 * programStartDateMs;
                 seekAirTimeTicks -= playbackStartTimeTicks;
                 playbackManager.seek(seekAirTimeTicks, player);
+            } else if (isInProgressRecording) {
+                // Cap seek to the current live edge so the user can't seek past available content
+                const liveEdgeTicks = getSeekableLiveEdgeTicks();
+                let seekTicks = newPercent / 100 * (recordingScheduledTicks || currentRuntimeTicks);
+                if (liveEdgeTicks != null) {
+                    seekTicks = Math.min(seekTicks, liveEdgeTicks);
+                }
+                playbackManager.seek(seekTicks, player);
             } else {
                 playbackManager.seekPercent(newPercent, player);
             }
         }
     });
+
+    if (btnGoLive) {
+        btnGoLive.addEventListener('click', function () {
+            const player = currentPlayer;
+            if (player && isInProgressRecording) {
+                const liveEdgeTicks = getSeekableLiveEdgeTicks();
+                if (liveEdgeTicks != null) {
+                    playbackManager.seek(liveEdgeTicks, player);
+                }
+            }
+        });
+    }
 
     nowPlayingPositionSlider.addEventListener('keydown', function (e) {
         if (e.defaultPrevented) return;

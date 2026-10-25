@@ -28,6 +28,7 @@ import { PlayerEvent } from 'apps/legacy/features/playback/constants/playerEvent
 import { bindMediaSegmentManager } from 'apps/legacy/features/playback/utils/mediaSegmentManager';
 import { bindMediaSessionSubscriber } from 'apps/legacy/features/playback/utils/mediaSessionSubscriber';
 import { AppFeature } from 'constants/appFeature';
+import actionSheet from 'components/actionSheet/actionSheet';
 import { PluginType } from 'constants/pluginType';
 import { TICKS_PER_SECOND } from 'constants/time';
 import { ServerConnections } from 'lib/jellyfin-apiclient';
@@ -38,6 +39,15 @@ import { bindSkipSegment } from './skipsegment.ts';
 import * as bitrateTest from 'utils/bitrateTest';
 
 const UNLIMITED_ITEMS = -1;
+
+function formatPlaybackPosition(positionTicks) {
+    const totalSeconds = Math.floor(positionTicks / TICKS_PER_SECOND);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    const pad = value => String(value).padStart(2, '0');
+    return hours > 0 ? `${hours}:${pad(minutes)}:${pad(seconds)}` : `${minutes}:${pad(seconds)}`;
+}
 
 function enableLocalPlaylistManagement(player) {
     if (player.getPlaylist) {
@@ -1665,6 +1675,12 @@ export class PlaybackManager {
             ticks = Math.max(0, ticks);
 
             player = player || self._currentPlayer;
+            const liveEdgeLimit = getInProgressRecordingSeekLimit(player);
+            if (liveEdgeLimit != null) {
+                // A seek beyond the written part of the recording should land just behind live.
+                ticks = Math.min(ticks, liveEdgeLimit);
+            }
+
             if (player && !enableLocalPlaylistManagement(player)) {
                 return player.seek(ticks);
             }
@@ -1674,13 +1690,39 @@ export class PlaybackManager {
 
         self.seekRelative = function (offsetTicks, player) {
             player = player || self._currentPlayer;
+            if (getInProgressRecordingSeekLimit(player) != null) {
+                return this.seek(getCurrentTicks(player) + offsetTicks, player);
+            }
+
             if (player && !enableLocalPlaylistManagement(player) && player.seekRelative) {
-                return player.seekRelative(ticks);
+                return player.seekRelative(offsetTicks);
             }
 
             const ticks = getCurrentTicks(player) + offsetTicks;
             return this.seek(ticks, player);
         };
+
+        function getInProgressRecordingSeekLimit(player) {
+            const mediaSource = player && getPlayerData(player).streamInfo?.mediaSource;
+            if (!mediaSource?.IsInProgressRecording) {
+                return null;
+            }
+
+            const seekableRanges = player.getSeekableRanges?.();
+            if (seekableRanges?.length) {
+                const latestRange = seekableRanges[seekableRanges.length - 1];
+                return Math.max(latestRange.start, latestRange.end - 2 * TICKS_PER_SECOND);
+            }
+
+            if (mediaSource.LiveEdgeTicks == null) {
+                return null;
+            }
+
+            const edgeObservedAt = mediaSource._liveEdgeObservedAt || Date.now();
+            const elapsedTicks = Math.max(0, Date.now() - edgeObservedAt) * TICKS_PER_SECOND / 1000;
+            const scheduledTicks = mediaSource.RunTimeTicks || Number.MAX_SAFE_INTEGER;
+            return Math.max(0, Math.min(mediaSource.LiveEdgeTicks + elapsedTicks, scheduledTicks) - 10 * TICKS_PER_SECOND);
+        }
 
         // Returns true if the player can seek using native client-side seeking functions
         function canPlayerSeek(player) {
@@ -2130,6 +2172,12 @@ export class PlaybackManager {
             }
 
             let { items } = options;
+            // Episode playback can be expanded into a freshly fetched series list below.
+            // Keep the recording metadata from the selected Live TV item before that happens.
+            const selectedRecording = items?.length === 1
+                && (items[0].IsInProgress || items[0].Status === 'InProgress')
+                ? items[0]
+                : null;
             // If items were not passed directly, fetch them by ID
             if (!items) {
                 if (!options.serverId) {
@@ -2157,6 +2205,19 @@ export class PlaybackManager {
             // getAdditionalParts returns an array of arrays of items, so flatten it
             items = items.flat();
 
+            // Preserve the active-recording fields when translateItemsForPlayback replaces
+            // the selected item with a fresh episode DTO that does not include Live TV fields.
+            const translatedRecording = selectedRecording && items.find(item => item.Id === selectedRecording.Id);
+            if (translatedRecording) {
+                translatedRecording.IsInProgress = true;
+                translatedRecording.Status = selectedRecording.Status || 'InProgress';
+                translatedRecording.StartDate = selectedRecording.StartDate;
+                translatedRecording.EndDate = selectedRecording.EndDate;
+                translatedRecording.RunTimeTicks = selectedRecording.RunTimeTicks;
+                translatedRecording.CompletionPercentage = selectedRecording.CompletionPercentage;
+            }
+
+            // Offer time-shift choices when a user starts a single in-progress DVR recording.
             return playWithIntros(items, options);
         };
 
@@ -2633,7 +2694,8 @@ export class PlaybackManager {
         }
 
         function playAfterBitrateDetect(maxBitrate, item, playOptions, onPlaybackStartedFn, prevSource) {
-            const startPosition = playOptions.startPositionTicks;
+            let startPosition = playOptions.startPositionTicks;
+            const canPromptForRecordingStart = playOptions.startPositionTicks == null;
 
             const player = getPlayer(item, playOptions);
             const activePlayer = self._currentPlayer;
@@ -2708,7 +2770,8 @@ export class PlaybackManager {
                     enableDirectPlay: null,
                     enableDirectStream: null,
                     allowVideoStreamCopy: null,
-                    allowAudioStreamCopy: null
+                    allowAudioStreamCopy: null,
+                    canPromptForRecordingStart
                 };
 
                 if (player && !enableLocalPlaylistManagement(player)) {
@@ -2736,6 +2799,8 @@ export class PlaybackManager {
                 }
 
                 return getPlaybackMediaSource(player, apiClient, deviceProfile, item, mediaSourceId, options).then(async (mediaSource) => {
+                    startPosition = options.startPosition;
+                    playOptions.startPositionTicks = startPosition;
                     if (trackOptions.DefaultSecondarySubtitleStreamIndex != null) {
                         mediaSource.DefaultSecondarySubtitleStreamIndex = trackOptions.DefaultSecondarySubtitleStreamIndex;
                     }
@@ -3015,10 +3080,48 @@ export class PlaybackManager {
                 if (validatePlaybackInfoResult(self, playbackInfoResult)) {
                     return getOptimalMediaSource(apiClient, item, playbackInfoResult.MediaSources).then(function (mediaSource) {
                         if (mediaSource) {
+                            if (mediaSource.IsInProgressRecording) {
+                                mediaSource._liveEdgeObservedAt = Date.now();
+                            }
+
                             // Remember whether alternate versions exists
                             mediaSource.hasAlternateVersions = playbackInfoResult.MediaSources.length > 1
                                 || item.MediaSources?.length > 1
                                 || (!!mediaSourceId && mediaSourceId !== item.Id);
+
+                            const isActiveRecording = mediaSource.IsInProgressRecording
+                                || item.IsInProgress === true
+                                || item.Status === 'InProgress';
+                            if (isActiveRecording && options.canPromptForRecordingStart) {
+                                const storedPosition = item.UserData?.PlaybackPositionTicks || 0;
+                                const getPlaybackPosition = storedPosition > 0
+                                    ? Promise.resolve(storedPosition)
+                                    : apiClient.getItem(apiClient.getCurrentUserId(), item.Id)
+                                        .then(freshItem => freshItem.UserData?.PlaybackPositionTicks || 0)
+                                        .catch(() => 0);
+
+                                return getPlaybackPosition.then(function (playbackPosition) {
+                                    // Keep first playback simple; offer resume when a position has been saved.
+                                    if (playbackPosition <= 0) {
+                                        return mediaSource;
+                                    }
+
+                                    return actionSheet.show({
+                                        title: item.Name,
+                                        items: [
+                                            { id: 'resume', name: globalize.translate('ResumeAt', formatPlaybackPosition(playbackPosition)) },
+                                            { id: 'beginning', name: globalize.translate('PlayFromBeginning') }
+                                        ],
+                                        resolveOnClick: true
+                                    }).then(function (choice) {
+                                        options.startPosition = choice === 'beginning'
+                                            ? 0
+                                            : Math.min(playbackPosition, mediaSource.LiveEdgeTicks ?? playbackPosition);
+                                        options.canPromptForRecordingStart = false;
+                                        return getPlaybackMediaSource(player, apiClient, deviceProfile, item, mediaSourceId, options);
+                                    });
+                                });
+                            }
 
                             if (mediaSource.RequiresOpening && !mediaSource.LiveStreamId) {
                                 options.audioStreamIndex = null;
